@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -152,13 +153,26 @@ func (conf *configuration) initUpstreams(
 		return fmt.Errorf("initializing bootstrap: %w", err)
 	}
 
+	// Determine geosite data directory
+	geositeDir := conf.GeodataDir
+	if geositeDir == "" {
+		// If not specified, look for geosite.dat in the config directory
+		configDir := filepath.Dir(conf.ConfigPath)
+		if configDir == "" || configDir == "." {
+			configDir, _ = os.Getwd()
+		}
+		geositeDir = configDir
+	}
+
 	upsOpts := &upstream.Options{
 		Logger:             l,
 		HTTPVersions:       httpVersions,
 		InsecureSkipVerify: conf.Insecure,
 		Bootstrap:          boot,
 		Timeout:            timeout,
+		GeositeDir:         geositeDir,
 	}
+
 	upstreams := loadServersList(conf.Upstreams)
 
 	config.UpstreamConfig, err = proxy.ParseUpstreamsConfig(upstreams, upsOpts)
@@ -171,6 +185,7 @@ func (conf *configuration) initUpstreams(
 		HTTPVersions: httpVersions,
 		Bootstrap:    boot,
 		Timeout:      min(defaultLocalTimeout, timeout),
+		GeositeDir:   geositeDir,
 	}
 	privateUpstreams := loadServersList(conf.PrivateRDNSUpstreams)
 

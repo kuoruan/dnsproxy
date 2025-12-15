@@ -106,6 +106,10 @@ type Options struct {
 	// PreferIPv6 tells the bootstrapper to prefer IPv6 addresses for an
 	// upstream.
 	PreferIPv6 bool
+
+	// GeositeDir is the directory containing geosite.dat and other geo data files.
+	// If provided, it will be used to enable geosite-based domain routing.
+	GeositeDir string
 }
 
 // Clone copies o to a new struct.  Note, that this is not a deep clone.

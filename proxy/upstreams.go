@@ -8,9 +8,11 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/AdguardTeam/dnsproxy/proxy/geosite"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 )
 
@@ -32,6 +34,55 @@ type UpstreamConfig struct {
 
 	// Upstreams is a list of default upstreams.
 	Upstreams []upstream.Upstream
+
+	// GeositeUpstreams is a list of geosite-based upstreams.
+	GeositeUpstreams []*geositeUpstream
+}
+
+// GeositeMatcher defines the interface for geosite domain matchers.
+// Implementations include single Matcher and CompositeMatcher (for OR logic).
+type GeositeMatcher interface {
+	Match(domain string) bool
+}
+
+// geositeCodeInfo encapsulates parsed information about a geosite code.
+type geositeCodeInfo struct {
+	// originalCode is the original geosite code (may contain negation marker)
+	// Example: "geolocation-!cn"
+	originalCode string
+
+	// actualCode is the actual code used for loading (negation marker removed)
+	// Example: "geolocation-cn" (from "geolocation-!cn")
+	actualCode string
+
+	// negate indicates whether this is a negation rule
+	negate bool
+}
+
+// parseGeositeCode parses a geosite code and extracts negation information.
+// Supports negation format: prefix-!suffix (e.g., "geolocation-!cn")
+func parseGeositeCode(code string) geositeCodeInfo {
+	info := geositeCodeInfo{
+		originalCode: code,
+		actualCode:   code,
+		negate:       false,
+	}
+
+	// Support all !code formats, e.g., geolocation-!cn, category-!ads
+	if idx := strings.Index(code, "-!"); idx != -1 {
+		// Extract the actual code after removing !
+		// For "geolocation-!cn", extract "geolocation-cn"
+		info.actualCode = code[:idx+1] + code[idx+2:]
+		info.negate = true
+	}
+
+	return info
+}
+
+// geositeUpstream represents a geosite rule and its corresponding upstreams.
+type geositeUpstream struct {
+	matcher   GeositeMatcher
+	upstreams []upstream.Upstream
 }
 
 // type check
@@ -87,6 +138,13 @@ var _ io.Closer = (*UpstreamConfig)(nil)
 // will send queries for all subdomains *.domain.com to 1.2.3.4, but domain.com
 // query will be sent to default server 3.4.5.6 as every other query.
 //
+// # Geosite upstreams
+//
+// If opts.GeositeDir is provided, you can use geosite rules:
+//
+//	[/geosite:google/]8.8.8.8
+//	[/geosite:geolocation-!cn/]1.1.1.1
+//
 // TODO(e.burkov):  Consider supporting multiple upstreams in a single line for
 // default upstream syntax.
 func ParseUpstreamsConfig(
@@ -101,6 +159,17 @@ func ParseUpstreamsConfig(
 		opts.Logger = slog.Default()
 	}
 
+	// Initialize geosite loader if path is provided
+	var geositeLoader *geosite.Loader
+	if opts.GeositeDir != "" {
+		geositeLoader, err = geosite.NewLoader(opts.GeositeDir, opts.Logger)
+		if err != nil {
+			opts.Logger.Warn("failed to initialize geosite loader", slogutil.KeyError, err)
+			// Continue without geosite support, don't return error
+			geositeLoader = nil
+		}
+	}
+
 	p := &configParser{
 		options:                  opts,
 		logger:                   opts.Logger,
@@ -109,6 +178,8 @@ func ParseUpstreamsConfig(
 		specifiedDomainUpstreams: map[string][]upstream.Upstream{},
 		subdomainsOnlyUpstreams:  map[string][]upstream.Upstream{},
 		subdomainsOnlyExclusions: container.NewMapSet[string](),
+		geositeLoader:            geositeLoader,
+		geositeUpstreams:         []*geositeUpstream{},
 	}
 
 	return p.parse(lines)
@@ -166,6 +237,12 @@ type configParser struct {
 
 	// upstreams is a list of default upstreams.
 	upstreams []upstream.Upstream
+
+	// geositeLoader is used to load geosite data.
+	geositeLoader *geosite.Loader
+
+	// geositeUpstreams is a list of geosite-based upstreams.
+	geositeUpstreams []*geositeUpstream
 }
 
 // parse returns UpstreamConfig and error if upstreams configuration is invalid.
@@ -188,6 +265,7 @@ func (p *configParser) parse(lines []string) (c *UpstreamConfig, err error) {
 		DomainReservedUpstreams:  p.domainReservedUpstreams,
 		SpecifiedDomainUpstreams: p.specifiedDomainUpstreams,
 		SubdomainExclusions:      p.subdomainsOnlyExclusions,
+		GeositeUpstreams:         p.geositeUpstreams,
 	}, errors.Join(errs...)
 }
 
@@ -197,10 +275,22 @@ func (p *configParser) parseLine(idx int, confLine string) (err error) {
 		return nil
 	}
 
-	upstreams, domains, err := splitConfigLine(confLine)
+	upstreams, domains, geositeCodes, err := splitConfigLine(confLine)
 	if err != nil {
 		// Don't wrap the error since it's informative enough as is.
 		return err
+	}
+
+	// Handle geosite rules - process all codes from the same line together
+	if len(geositeCodes) > 0 {
+		if err = p.specifyGeositeUpstreams(geositeCodes, upstreams, idx); err != nil {
+			return err
+		}
+
+		// If there are geosite codes and no domains, we are done (geosite-only rule)
+		if len(domains) == 0 {
+			return nil
+		}
 	}
 
 	if upstreams[0] == "#" && len(domains) > 0 {
@@ -222,15 +312,21 @@ func (p *configParser) parseLine(idx int, confLine string) (err error) {
 
 // splitConfigLine parses upstream configuration line and returns list upstream
 // addresses (one or many), list of domains for which this upstream is reserved
-// (may be nil).  It returns an error if the upstream format is incorrect.
-func splitConfigLine(confLine string) (upstreams, domains []string, err error) {
+// (may be nil), and geosite codes if applicable.  It returns an error if the
+// upstream format is incorrect.
+func splitConfigLine(confLine string) (
+	upstreams []string,
+	domains []string,
+	geositeCodes []string,
+	err error,
+) {
 	if !strings.HasPrefix(confLine, "[/") {
-		return []string{confLine}, nil, nil
+		return []string{confLine}, nil, nil, nil
 	}
 
 	domainsLine, upstreamsLine, found := strings.Cut(confLine[len("[/"):], "/]")
 	if !found || upstreamsLine == "" {
-		return nil, nil, errors.Error("wrong upstream format")
+		return nil, nil, nil, errors.Error("wrong upstream format")
 	}
 
 	// split domains list
@@ -242,15 +338,24 @@ func splitConfigLine(confLine string) (upstreams, domains []string, err error) {
 			continue
 		}
 
+		// Check if this is a geosite rule
+		if strings.HasPrefix(confHost, "geosite:") {
+			code := strings.TrimPrefix(confHost, "geosite:")
+			if code != "" {
+				geositeCodes = append(geositeCodes, code)
+			}
+			continue
+		}
+
 		host := strings.TrimPrefix(confHost, "*.")
 		if err = netutil.ValidateDomainName(host); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		domains = append(domains, strings.ToLower(confHost+"."))
 	}
 
-	return strings.Fields(upstreamsLine), domains, nil
+	return strings.Fields(upstreamsLine), domains, geositeCodes, nil
 }
 
 // specifyUpstream specifies the upstream for domains.
@@ -287,6 +392,150 @@ func (p *configParser) specifyUpstream(domains []string, u string, idx int) (err
 	}
 
 	return nil
+}
+
+// specifyGeositeUpstreams specifies the upstream for multiple geosite rules from the same line.
+// All codes from the same configuration line are processed together and create a single
+// geositeUpstream entry with a composite matcher.
+func (p *configParser) specifyGeositeUpstreams(
+	geositeCodes []string,
+	upstreamAddrs []string,
+	lineIdx int,
+) (err error) {
+	if p.geositeLoader == nil {
+		p.logger.Warn(
+			"geosite rules skipped: loader not initialized",
+			"line", lineIdx,
+			"codes", geositeCodes,
+		)
+		return nil
+	}
+
+	if len(geositeCodes) == 0 {
+		return nil
+	}
+
+	// Create matchers for all codes
+	matchers := p.createGeositeMatchers(geositeCodes, lineIdx)
+	if len(matchers) == 0 {
+		p.logger.Warn(
+			"no valid geosite matchers created",
+			"line", lineIdx,
+			"codes", geositeCodes,
+		)
+		return nil
+	}
+
+	// Create upstream list
+	upstreams, err := p.createUpstreams(upstreamAddrs)
+	if err != nil {
+		return fmt.Errorf("failed to create upstreams: %w", err)
+	}
+
+	// Create the appropriate matcher based on number of matchers
+	finalMatcher := p.buildFinalMatcher(matchers)
+
+	// Add to geosite upstreams list
+	p.geositeUpstreams = append(p.geositeUpstreams, &geositeUpstream{
+		matcher:   finalMatcher,
+		upstreams: upstreams,
+	})
+
+	p.logger.Debug(
+		"geosite upstream configured",
+		"line", lineIdx,
+		"codes", geositeCodes,
+		"matchers", len(matchers),
+		"upstreams", len(upstreams),
+	)
+
+	return nil
+}
+
+// createGeositeMatchers creates matchers for all geosite codes
+func (p *configParser) createGeositeMatchers(codes []string, lineIdx int) []*geosite.Matcher {
+	// Parse all codes to extract actual codes (removing negation markers)
+	codeInfos := make([]geositeCodeInfo, 0, len(codes))
+	actualCodes := make([]string, 0, len(codes))
+
+	for _, code := range codes {
+		info := parseGeositeCode(code)
+		codeInfos = append(codeInfos, info)
+		actualCodes = append(actualCodes, info.actualCode)
+	}
+
+	// Batch load all geosite data
+	if err := p.geositeLoader.Load(actualCodes); err != nil {
+		p.logger.Warn(
+			"failed to load geosite data",
+			"line", lineIdx,
+			"error", err,
+		)
+		// Continue with whatever was loaded
+	}
+
+	// Batch get all sites
+	sites, notFound := p.geositeLoader.GetSites(actualCodes)
+
+	// Log not found codes
+	if len(notFound) > 0 {
+		p.logger.Warn(
+			"some geosite codes not found",
+			"line", lineIdx,
+			"codes", notFound,
+		)
+	}
+
+	// Create matchers for successfully loaded sites
+	matchers := make([]*geosite.Matcher, 0, len(sites))
+	for _, info := range codeInfos {
+		if site, ok := sites[info.actualCode]; ok {
+			matcher := geosite.NewMatcher(site, info.originalCode, info.negate)
+			matchers = append(matchers, matcher)
+		}
+	}
+
+	return matchers
+}
+
+// createUpstreams creates upstream instances from addresses
+func (p *configParser) createUpstreams(addrs []string) ([]upstream.Upstream, error) {
+	upstreams := make([]upstream.Upstream, 0, len(addrs))
+
+	for _, addr := range addrs {
+		u, err := p.getOrCreateUpstream(addr)
+		if err != nil {
+			return nil, fmt.Errorf("upstream %q: %w", addr, err)
+		}
+		upstreams = append(upstreams, u)
+	}
+
+	return upstreams, nil
+}
+
+// getOrCreateUpstream gets an existing upstream or creates a new one
+func (p *configParser) getOrCreateUpstream(addr string) (upstream.Upstream, error) {
+	if u, ok := p.upstreamsIndex[addr]; ok {
+		return u, nil
+	}
+
+	u, err := upstream.AddressToUpstream(addr, p.options.Clone())
+	if err != nil {
+		return nil, err
+	}
+
+	p.upstreamsIndex[addr] = u
+	return u, nil
+}
+
+// buildFinalMatcher creates the final matcher from a list of matchers
+func (p *configParser) buildFinalMatcher(matchers []*geosite.Matcher) GeositeMatcher {
+	if len(matchers) == 1 {
+		// Single matcher, use it directly
+		return matchers[0]
+	}
+	// Multiple matchers, use composite matcher (OR logic)
+	return geosite.NewCompositeMatcher(matchers)
 }
 
 // excludeFromReserved excludes more specific domains from reserved upstreams
@@ -379,6 +628,16 @@ func ValidatePrivateConfig(uc *UpstreamConfig, privateSubnets netutil.SubnetSet)
 // The request for mail.host.com will be resolved using the upstreams specified
 // for host.com.
 func (uc *UpstreamConfig) getUpstreamsForDomain(fqdn string) (ups []upstream.Upstream) {
+	// 1. First check geosite rules (highest priority)
+	if len(uc.GeositeUpstreams) > 0 {
+		for _, gu := range uc.GeositeUpstreams {
+			if gu.matcher.Match(fqdn) {
+				return gu.upstreams
+			}
+		}
+	}
+
+	// 2. Then check domain-specific configuration
 	if len(uc.DomainReservedUpstreams) == 0 {
 		return uc.Upstreams
 	}

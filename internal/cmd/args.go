@@ -39,6 +39,7 @@ const (
 	privateSubnetsIdx
 	bogusNXDomainIdx
 	hostsFilesIdx
+	geodataDirIdx
 	timeoutIdx
 	cacheMinTTLIdx
 	cacheMaxTTLIdx
@@ -228,6 +229,13 @@ var commandLineOptions = []*commandLineOption{
 		long:        "hosts-files",
 		short:       "",
 		valueType:   "path",
+	},
+	geodataDirIdx: {
+		description: "Directory containing geosite.dat and other geo data files for geosite-based upstream routing. " +
+			"If not specified, dnsproxy will look for geo data files in the same directory as the configuration file.",
+		long:      "geodata-dir",
+		short:     "",
+		valueType: "path",
 	},
 	timeoutIdx: {
 		description: "Timeout for outbound DNS queries to remote upstream servers in a " +
@@ -436,6 +444,7 @@ func parseCmdLineOptions(conf *configuration) (err error) {
 		privateSubnetsIdx:           &conf.PrivateSubnets,
 		bogusNXDomainIdx:            &conf.BogusNXDomain,
 		hostsFilesIdx:               &conf.HostsFiles,
+		geodataDirIdx:               &conf.GeodataDir,
 		timeoutIdx:                  &conf.Timeout,
 		cacheMinTTLIdx:              &conf.CacheMinTTL,
 		cacheMaxTTLIdx:              &conf.CacheMaxTTL,

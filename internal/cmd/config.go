@@ -94,6 +94,11 @@ type configuration struct {
 	// HostsFiles is the list of paths to the hosts files to resolve from.
 	HostsFiles []string `yaml:"hosts-files"`
 
+	// GeodataDir is the directory containing geosite.dat and other geo data files
+	// for geosite-based upstream routing.  If not specified, dnsproxy will look
+	// for geo data files in the same directory as the configuration file.
+	GeodataDir string `yaml:"geodata-dir"`
+
 	// Timeout for outbound DNS queries to remote upstream servers in a
 	// human-readable form.  Default is 10s.
 	Timeout timeutil.Duration `yaml:"timeout"`
